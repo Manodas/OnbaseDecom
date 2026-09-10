@@ -1,9 +1,0 @@
-﻿POST DECOM TOOL - Background Activity Log
-Session ID: 380e3b73
-Started: 2026-08-19 21:37:14 +05:30
-Operator: ONBASE\mdas
-Computer: HYL-066769
-Tool directory: C:\Users\mdas\OneDrive - Hyland Software\Desktop\PS\Decom\DecommissioningTool
-----------------------------------------------------------------------------------------------------
-[21:37:14] Application ready. Use What If before running destructive actions.
-[21:37:14] Background activity is being saved automatically to: C:\Users\mdas\OneDrive - Hyland Software\Desktop\PS\Decom\DecommissioningTool\Logs\BackgroundActivity_20260819_213714_mdas_380e3b73.txt
