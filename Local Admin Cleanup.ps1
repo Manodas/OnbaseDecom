@@ -403,11 +403,16 @@ foreach ($server in $servers) {
     }
 }
 
-if ($script:AuditRecords.Count -eq 0) {
-    Add-AuditRecord -Server $null -Group $null -Name $Instance -Class 'Group' `
-        -Path $null -Action 'Discover' -Result 'NoMatches' -ErrorMessage $null
+# The combined SCAN already records discovery in the session activity log and
+# exposes the matches in its read-only result grid.  Create this separate audit
+# CSV only for an actual cleanup or a WhatIf cleanup preview.
+if (-not $DiscoveryOnly) {
+    if ($script:AuditRecords.Count -eq 0) {
+        Add-AuditRecord -Server $null -Group $null -Name $Instance -Class 'Group' `
+            -Path $null -Action 'Discover' -Result 'NoMatches' -ErrorMessage $null
+    }
+    Save-AuditReport
 }
-Save-AuditReport
 
 if ($hadFailures) {
     if ($DiscoveryOnly) {

@@ -45,7 +45,10 @@ GUI workflow:
      normal read-only Scan Results grids and to the corresponding action's
      later confirmation and exact target manifest.
   5. Run "What If (All)" and review the activity log.
-  6. Run the required destructive action button.
+  6. Run the required destructive action button. Delete Services, IIS Pool and
+     Site Decom, Local Admin Cleanup, and ODBC DSN Cleanup reuse the latest
+     successful Scan Results instead of running a second discovery pass. The
+     scan must still match the current inputs and be no more than 30 minutes old.
 
 Background activity text log:
   - Each normal application session automatically creates one UTF-8 text file
@@ -73,10 +76,10 @@ Safety:
     shown separately as an opt-in candidate; it is never included merely by
     running Delete Services. Checked candidates are re-discovered by exact
     server/name and the name-only rule is revalidated before deletion.
-  - "Delete Services" first performs read-only discovery and shows every
-    server, service name, display name, state, and Log On As account. It also
-    discovers lines containing the instance token in these files on every
-    service server:
+  - "Delete Services" uses the services and GCS entries already displayed by
+    the latest valid SCAN. It shows every server, service name, display name,
+    state, and Log On As account before confirmation. SCAN also discovers lines
+    containing the instance token in these files on every service server:
       C:\OBOL\Utilities\GCSserviceStartRestarter\MonitoredServices.txt
       C:\OBOL\Utilities\GCSserviceStartRestarter\ServicestoRestart.txt
   - The confirmation window shows both services and GCS list entries. Only
@@ -85,8 +88,10 @@ Safety:
   - GCS list files are replaced atomically and receive timestamped .bak files.
     Comment lines beginning with # or ; are preserved. If a confirmed service
     fails to stop or delete, GCS list cleanup is skipped on that server.
-  - "IIS Pool and Site Decom" first performs read-only discovery and shows
-    every matching site, child application, eligible pool, and blocked pool.
+  - "IIS Pool and Site Decom" uses the latest valid SCAN and shows every
+    matching site, internally retained child application, eligible pool, and
+    blocked pool. The intentionally hidden child-application records remain in
+    the exact IIS removal plan without restoring a separate applications tab.
   - Only IIS rows marked DELETE in that confirmation window are placed in the
     exact target manifest; live pool dependencies are checked again before
     removal.
@@ -113,10 +118,13 @@ Safety:
   - The built-in Administrators group is resolved by SID on each server, so
     localized Windows group names are supported.
   - Local-admin targets are shown with their exact ADSI paths before removal.
+    The cleanup button uses the latest valid SCAN rather than repeating discovery.
+    Read-only SCAN does not create a separate LocalAdmins_Audit CSV; cleanup and
+    WhatIf cleanup runs continue to create the audit report.
   - "ODBC DSN Cleanup" searches both 64-bit and 32-bit machine registry views
-    across the combined server lists. It matches the instance token in System
-    DSN names, shows architecture, driver, data server, database, and registry
-    path, then deletes only exact confirmed targets after live revalidation.
+    during SCAN across the combined server lists. The cleanup button uses those
+    cached results, shows architecture, driver, data server, database, and
+    registry path, then deletes only exact confirmed targets after live revalidation.
     Each membership is revalidated before and after removal, and every run
     writes a timestamped CSV audit report under the Logs folder.
 

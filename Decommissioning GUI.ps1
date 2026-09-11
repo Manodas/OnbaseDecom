@@ -356,6 +356,7 @@ $script:LatestScanInstance = ''
 $script:LatestScanTimestamp = [datetime]::MinValue
 $script:LatestScanHadErrors = $false
 $script:LatestScanContext = $null
+$script:ScanCacheMaximumAge = [TimeSpan]::FromMinutes(30)
 $script:CandidateSelectionControls = @()
 $script:CandidateSelectionValid = $false
 $script:ActivityLogSessionId = [guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -1557,11 +1558,17 @@ function Update-ScanResultsPanel {
             'Automatic'
         }
     }
-    $displayResults = @(Get-VisibleScanResults -ScanResults $results)
+    # Child IIS applications are retained in the scan cache because they are
+    # required by the dependency-aware removal manifest.  They remain hidden
+    # from the main scan tabs, matching the intentionally simplified UI.
+    $displayResults = @(
+        Get-VisibleScanResults -ScanResults $results |
+            Where-Object { [string]$_.Category -ne 'IISApplications' }
+    )
     $script:LatestScanResults = @($results)
     $script:LatestVisibleScanResults = @($displayResults)
     $script:LatestScanInstance = $Instance
-    $script:LatestScanTimestamp = if ($results.Count -gt 0) { Get-Date } else { [datetime]::MinValue }
+    $script:LatestScanTimestamp = if (-not [string]::IsNullOrWhiteSpace($Instance)) { Get-Date } else { [datetime]::MinValue }
     $script:LatestScanHadErrors = $HadDiscoveryErrors
     $script:CandidateSelectionValid = ($results.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($Instance))
     $exportScanButton.Enabled = ($displayResults.Count -gt 0 -and $null -eq $script:CurrentJob)
@@ -3609,6 +3616,255 @@ $jobTimer.Add_Tick({
     }
 })
 
+function Test-ServerSetMatches {
+    param(
+        [object[]]$Expected,
+        [object[]]$Actual
+    )
+
+    $expectedNames = @(
+        $Expected |
+            ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } |
+            Where-Object { $_ } |
+            Sort-Object -Unique
+    )
+    $actualNames = @(
+        $Actual |
+            ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } |
+            Where-Object { $_ } |
+            Sort-Object -Unique
+    )
+    if ($expectedNames.Count -ne $actualNames.Count) { return $false }
+    return (@(Compare-Object -ReferenceObject $expectedNames -DifferenceObject $actualNames).Count -eq 0)
+}
+
+function Test-LatestScanCache {
+    param(
+        [Parameter(Mandatory)][string]$Instance,
+        [switch]$CheckServiceServers,
+        [object[]]$ServiceServers = @(),
+        [switch]$CheckApplicationServers,
+        [object[]]$ApplicationServers = @(),
+        [switch]$CheckMatchMode,
+        [string]$MatchMode = ''
+    )
+
+    if ($null -eq $script:LatestScanContext -or
+        $script:LatestScanTimestamp -eq [datetime]::MinValue) {
+        Show-InputError 'Run SCAN first. The action buttons use the latest read-only Scan Results and no longer perform a second discovery scan.'
+        return $false
+    }
+    if ($script:LatestScanHadErrors) {
+        Show-InputError 'The latest scan was incomplete. Review the background activity, correct the scan errors, and run SCAN again before deleting anything.'
+        return $false
+    }
+    if (((Get-Date) - $script:LatestScanTimestamp) -gt $script:ScanCacheMaximumAge) {
+        Show-InputError ('The latest scan is older than {0} minutes. Run SCAN again so the decommission plan is based on current information.' -f [int]$script:ScanCacheMaximumAge.TotalMinutes)
+        return $false
+    }
+    if (-not ([string]$script:LatestScanContext.Instance).Equals(
+            $Instance,
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        Show-InputError 'The instance token no longer matches the latest Scan Results. Run SCAN again.'
+        return $false
+    }
+    if ($CheckServiceServers -and
+        -not (Test-ServerSetMatches -Expected $ServiceServers -Actual @($script:LatestScanContext.ServiceServers))) {
+        Show-InputError 'The service-server list no longer matches the latest Scan Results. Run SCAN again.'
+        return $false
+    }
+    if ($CheckApplicationServers -and
+        -not (Test-ServerSetMatches -Expected $ApplicationServers -Actual @($script:LatestScanContext.ApplicationServers))) {
+        Show-InputError 'The application/IIS-server list no longer matches the latest Scan Results. Run SCAN again.'
+        return $false
+    }
+    if ($CheckMatchMode -and
+        -not ([string]$script:LatestScanContext.MatchMode).Equals(
+            $MatchMode,
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        Show-InputError 'The IIS match mode no longer matches the latest Scan Results. Run SCAN again.'
+        return $false
+    }
+    return $true
+}
+
+function Get-CachedScanTargets {
+    param([Parameter(Mandatory)][string[]]$Categories)
+
+    @(
+        $script:LatestScanResults |
+            Where-Object {
+                $Categories -contains [string]$_.Category -and
+                (-not [bool]$_.IsOptInCandidate -or [bool]$_.OptInSelected)
+            }
+    )
+}
+
+function Invoke-CachedServiceDeletion {
+    param(
+        [Parameter(Mandatory)][string[]]$Servers,
+        [Parameter(Mandatory)][string]$Instance
+    )
+
+    $targets = @(Get-CachedScanTargets -Categories @('Services'))
+    Add-ActivityLog -Message ("Using {0} service/GCS target(s) from Scan Results captured at {1:HH:mm:ss}. Live targets will be revalidated before deletion." -f $targets.Count, $script:LatestScanTimestamp) -Color ([System.Drawing.Color]::FromArgb(103, 232, 249))
+    if ($targets.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            $form,
+            "The latest Scan Results contain no approved service or GCS-list targets for '$Instance'.",
+            'No matching service targets',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        return
+    }
+    if (-not (Show-ServiceDeletionConfirmation -ServiceTargets $targets -AccountToken $Instance)) {
+        Add-ActivityLog -Message 'Service deletion cancelled at the confirmation window.' -Color ([System.Drawing.Color]::FromArgb(251, 191, 36))
+        return
+    }
+
+    $serverText = $Servers -join ','
+    $manifest = ConvertTo-ServiceManifestArgument -ServiceTargets $targets
+    $steps = New-Object System.Collections.ArrayList
+    [void]$steps.Add((New-WorkerStep -Title 'Revalidate and delete confirmed services and clean GCS lists' -ScriptPath $serviceScript -Arguments @(
+        '-ComputerName', $serverText,
+        '-LogOnAsToken', $Instance,
+        '-TargetManifestBase64', $manifest,
+        '-Force'
+    ) -Category 'Services' -Server $serverText `
+        -ReportTargets @(ConvertTo-ActionReportTargets -Records $targets -DefaultCategory 'Services')))
+    Start-BackgroundSteps -Steps $steps -ActionName 'Delete services and clean GCS lists' `
+        -Context ([PSCustomObject]@{ ProgressServers = @($Servers) })
+    if ($null -ne $script:CurrentJob) { $jobTimer.Start() }
+}
+
+function Invoke-CachedIISDeletion {
+    param(
+        [Parameter(Mandatory)][string[]]$Servers,
+        [Parameter(Mandatory)][string]$Instance,
+        [Parameter(Mandatory)][string]$MatchMode
+    )
+
+    $targets = @(Get-CachedScanTargets -Categories @('IISSites', 'IISApplications', 'ApplicationPools'))
+    $plannedTargets = @($targets | Where-Object { [bool]$_.Planned })
+    Add-ActivityLog -Message ("Using {0} IIS target(s) from Scan Results captured at {1:HH:mm:ss}; {2} target(s) are eligible. Live dependencies will be revalidated before deletion." -f $targets.Count, $script:LatestScanTimestamp, $plannedTargets.Count) -Color ([System.Drawing.Color]::FromArgb(103, 232, 249))
+    if ($targets.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            $form,
+            "The latest Scan Results contain no IIS targets for '$Instance'.",
+            'No matching IIS targets',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        return
+    }
+    if ($plannedTargets.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            $form,
+            'The latest Scan Results contain IIS matches, but every target is blocked by a dependency. Nothing can be deleted.',
+            'All IIS targets are blocked',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+        return
+    }
+    if (-not (Show-IISDeletionConfirmation -IISTargets $targets -Instance $Instance -MatchMode $MatchMode)) {
+        Add-ActivityLog -Message 'IIS deletion cancelled at the confirmation window.' -Color ([System.Drawing.Color]::FromArgb(251, 191, 36))
+        return
+    }
+
+    $serverText = $Servers -join ','
+    $manifest = ConvertTo-IISTargetManifestArgument -IISTargets $plannedTargets
+    $steps = New-Object System.Collections.ArrayList
+    [void]$steps.Add((New-WorkerStep -Title 'Revalidate and delete confirmed IIS targets' -ScriptPath $iisScript -Arguments @(
+        '-ComputerName', $serverText,
+        '-Instance', $Instance,
+        '-MatchMode', $MatchMode,
+        '-TargetManifestBase64', $manifest,
+        '-Force'
+    ) -Category 'IIS' -Server $serverText `
+        -ReportTargets @(ConvertTo-ActionReportTargets -Records $plannedTargets -DefaultCategory 'IIS')))
+    Start-BackgroundSteps -Steps $steps -ActionName 'IIS Pool and Site Decom' `
+        -Context ([PSCustomObject]@{ ProgressServers = @($Servers) })
+    if ($null -ne $script:CurrentJob) { $jobTimer.Start() }
+}
+
+function Invoke-CachedODBCCleanup {
+    param(
+        [Parameter(Mandatory)][string[]]$Servers,
+        [Parameter(Mandatory)][string]$Instance
+    )
+
+    $targets = @(Get-CachedScanTargets -Categories @('ODBCDataSources'))
+    Add-ActivityLog -Message ("Using {0} ODBC System DSN target(s) from Scan Results captured at {1:HH:mm:ss}. Both registry views will be revalidated before deletion." -f $targets.Count, $script:LatestScanTimestamp) -Color ([System.Drawing.Color]::FromArgb(103, 232, 249))
+    if ($targets.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            $form,
+            "The latest Scan Results contain no 32-bit or 64-bit System DSNs for '$Instance'.",
+            'No matching System DSNs',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        return
+    }
+    if (-not (Show-ODBCCleanupConfirmation -ODBCTargets $targets -Instance $Instance)) {
+        Add-ActivityLog -Message 'ODBC System DSN cleanup cancelled at the confirmation window.' -Color ([System.Drawing.Color]::FromArgb(251, 191, 36))
+        return
+    }
+
+    $serverText = $Servers -join ','
+    $manifest = ConvertTo-ODBCTargetManifestArgument -ODBCTargets $targets
+    $steps = New-Object System.Collections.ArrayList
+    [void]$steps.Add((New-WorkerStep -Title 'Revalidate and delete confirmed ODBC System DSNs' -ScriptPath $odbcScript -Arguments @(
+        '-ComputerName', $serverText,
+        '-Instance', $Instance,
+        '-TargetManifestBase64', $manifest,
+        '-Force'
+    ) -Category 'ODBCDataSources' -Server $serverText `
+        -ReportTargets @(ConvertTo-ActionReportTargets -Records $targets -DefaultCategory 'ODBCDataSources')))
+    Start-BackgroundSteps -Steps $steps -ActionName 'ODBC System DSN Cleanup' `
+        -Context ([PSCustomObject]@{ ProgressServers = @($Servers) })
+    if ($null -ne $script:CurrentJob) { $jobTimer.Start() }
+}
+
+function Invoke-CachedLocalAdminCleanup {
+    param(
+        [Parameter(Mandatory)][string[]]$Servers,
+        [Parameter(Mandatory)][string]$Instance
+    )
+
+    $targets = @(Get-CachedScanTargets -Categories @('LocalAdmins'))
+    Add-ActivityLog -Message ("Using {0} local-admin target(s) from Scan Results captured at {1:HH:mm:ss}. Membership will be revalidated before removal." -f $targets.Count, $script:LatestScanTimestamp) -Color ([System.Drawing.Color]::FromArgb(103, 232, 249))
+    if ($targets.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            $form,
+            "The latest Scan Results contain no local Administrators group principals for '$Instance'.",
+            'No matching local-admin targets',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        return
+    }
+    if (-not (Show-LocalAdminCleanupConfirmation -LocalAdminTargets $targets -Instance $Instance)) {
+        Add-ActivityLog -Message 'Local-admin cleanup cancelled at the confirmation window.' -Color ([System.Drawing.Color]::FromArgb(251, 191, 36))
+        return
+    }
+
+    $serverText = $Servers -join ','
+    $manifest = ConvertTo-LocalAdminTargetManifestArgument -LocalAdminTargets $targets
+    $steps = New-Object System.Collections.ArrayList
+    [void]$steps.Add((New-WorkerStep -Title 'Revalidate and remove confirmed local Administrators groups' -ScriptPath $localAdminScript -Arguments @(
+        '-ComputerName', $serverText,
+        '-Instance', $Instance,
+        '-TargetManifestBase64', $manifest,
+        '-Force'
+    ) -Category 'LocalAdmins' -Server $serverText `
+        -ReportTargets @(ConvertTo-ActionReportTargets -Records $targets -DefaultCategory 'LocalAdmins')))
+    Start-BackgroundSteps -Steps $steps -ActionName 'Local Admin Cleanup' `
+        -Context ([PSCustomObject]@{ ProgressServers = @($Servers) })
+    if ($null -ne $script:CurrentJob) { $jobTimer.Start() }
+}
+
 $serviceServersTextBox.Add_TextChanged({
     Clear-FolderSelection -WriteLog
     Clear-OptInCandidateSelections -WriteLog
@@ -3669,27 +3925,12 @@ $deleteServicesButton.Add_Click({
         return
     }
 
-    $steps = New-Object System.Collections.ArrayList
-    [void]$steps.Add((New-WorkerStep -Title 'Discover matching services' -ScriptPath $serviceScript -Arguments @(
-        '-ComputerName', $servers,
-        '-LogOnAsToken', $instance,
-        '-DiscoveryOnly',
-        '-EmitDiscoveryJson',
-        '-IncludeNameOnlyCandidates'
-    )))
-    $context = [PSCustomObject]@{
-        Servers = $servers
-        Token   = $instance
-        ProgressServers = @(ConvertTo-ServerArray -Text @($serviceServersTextBox.Text))
+    $serverArray = @(ConvertTo-ServerArray -Text @($serviceServersTextBox.Text))
+    if (-not (Test-LatestScanCache -Instance $instance `
+            -CheckServiceServers -ServiceServers $serverArray)) {
+        return
     }
-    Start-BackgroundSteps `
-        -Steps $steps `
-        -ActionName 'Service discovery' `
-        -JobKind 'ServiceDiscovery' `
-        -Context $context
-    if ($null -ne $script:CurrentJob) {
-        $jobTimer.Start()
-    }
+    Invoke-CachedServiceDeletion -Servers $serverArray -Instance $instance
 })
 
 $iisButton.Add_Click({
@@ -3705,28 +3946,13 @@ $iisButton.Add_Click({
         return
     }
 
-    $steps = New-Object System.Collections.ArrayList
-    [void]$steps.Add((New-WorkerStep -Title 'Discover matching IIS targets' -ScriptPath $iisScript -Arguments @(
-        '-ComputerName', $servers,
-        '-Instance', $instance,
-        '-MatchMode', $matchMode,
-        '-DiscoveryOnly',
-        '-EmitDiscoveryJson'
-    )))
-    $context = [PSCustomObject]@{
-        Servers   = $servers
-        Instance  = $instance
-        MatchMode = $matchMode
-        ProgressServers = @(ConvertTo-ServerArray -Text @($applicationServersTextBox.Text))
+    $serverArray = @(ConvertTo-ServerArray -Text @($applicationServersTextBox.Text))
+    if (-not (Test-LatestScanCache -Instance $instance `
+            -CheckApplicationServers -ApplicationServers $serverArray `
+            -CheckMatchMode -MatchMode $matchMode)) {
+        return
     }
-    Start-BackgroundSteps `
-        -Steps $steps `
-        -ActionName 'IIS discovery' `
-        -JobKind 'IISDiscovery' `
-        -Context $context
-    if ($null -ne $script:CurrentJob) {
-        $jobTimer.Start()
-    }
+    Invoke-CachedIISDeletion -Servers $serverArray -Instance $instance -MatchMode $matchMode
 })
 
 $localAdminButton.Add_Click({
@@ -3748,27 +3974,14 @@ $localAdminButton.Add_Click({
         }
     }
 
-    $serverText = $servers -join ','
-    $steps = New-Object System.Collections.ArrayList
-    [void]$steps.Add((New-WorkerStep -Title 'Discover matching local Administrators groups' -ScriptPath $localAdminScript -Arguments @(
-        '-ComputerName', $serverText,
-        '-Instance', $instance,
-        '-DiscoveryOnly',
-        '-EmitDiscoveryJson'
-    )))
-    $context = [PSCustomObject]@{
-        Servers  = $serverText
-        Instance = $instance
-        ProgressServers = @($servers)
+    $serviceServers = @(ConvertTo-ServerArray -Text @($serviceServersTextBox.Text))
+    $applicationServers = @(ConvertTo-ServerArray -Text @($applicationServersTextBox.Text))
+    if (-not (Test-LatestScanCache -Instance $instance `
+            -CheckServiceServers -ServiceServers $serviceServers `
+            -CheckApplicationServers -ApplicationServers $applicationServers)) {
+        return
     }
-    Start-BackgroundSteps `
-        -Steps $steps `
-        -ActionName 'Local-admin discovery' `
-        -JobKind 'LocalAdminDiscovery' `
-        -Context $context
-    if ($null -ne $script:CurrentJob) {
-        $jobTimer.Start()
-    }
+    Invoke-CachedLocalAdminCleanup -Servers $servers -Instance $instance
 })
 
 $odbcButton.Add_Click({
@@ -3794,27 +4007,14 @@ $odbcButton.Add_Click({
         }
     }
 
-    $serverText = $servers -join ','
-    $steps = New-Object System.Collections.ArrayList
-    [void]$steps.Add((New-WorkerStep -Title 'Discover matching ODBC System DSNs' -ScriptPath $odbcScript -Arguments @(
-        '-ComputerName', $serverText,
-        '-Instance', $instance,
-        '-DiscoveryOnly',
-        '-EmitDiscoveryJson'
-    )))
-    $context = [PSCustomObject]@{
-        Servers  = $serverText
-        Instance = $instance
-        ProgressServers = @($servers)
+    $serviceServers = @(ConvertTo-ServerArray -Text @($serviceServersTextBox.Text))
+    $applicationServers = @(ConvertTo-ServerArray -Text @($applicationServersTextBox.Text))
+    if (-not (Test-LatestScanCache -Instance $instance `
+            -CheckServiceServers -ServiceServers $serviceServers `
+            -CheckApplicationServers -ApplicationServers $applicationServers)) {
+        return
     }
-    Start-BackgroundSteps `
-        -Steps $steps `
-        -ActionName 'ODBC System DSN discovery' `
-        -JobKind 'ODBCDiscovery' `
-        -Context $context
-    if ($null -ne $script:CurrentJob) {
-        $jobTimer.Start()
-    }
+    Invoke-CachedODBCCleanup -Servers $servers -Instance $instance
 })
 
 $folderButton.Add_Click({

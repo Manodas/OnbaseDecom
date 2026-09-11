@@ -164,11 +164,9 @@ if ($applicationServers.Count -gt 0) {
         -Marker '@@IIS_TARGET@@' `
         -ConvertRecord {
             param($source)
-            if ([string]$source.TargetType -eq 'Application') {
-                return $null
-            }
             $category = switch ([string]$source.TargetType) {
                 'Site'        { 'IISSites' }
+                'Application' { 'IISApplications' }
                 'AppPool'     { 'ApplicationPools' }
                 default       { 'IISSites' }
             }
@@ -184,6 +182,7 @@ if ($applicationServers.Count -gt 0) {
                 Path          = [string]$source.ApplicationPath
                 Entry         = ''
                 SiteName      = [string]$source.SiteName
+                ApplicationPath = [string]$source.ApplicationPath
                 AppPoolName   = [string]$source.AppPoolName
                 Details       = [string]$source.Details
                 BlockedReason = [string]$source.BlockedReason
